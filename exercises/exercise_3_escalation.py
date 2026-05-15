@@ -30,7 +30,7 @@ console = Console()
 
 
 def node_fetch_pr(state):
-    console.print("[cyan]→ fetch_pr[/cyan]")
+    console.print("[cyan]-> fetch_pr[/cyan]")
     with console.status("[dim]Fetching PR from GitHub...[/dim]"):
         pr = fetch_pr(state["pr_url"])
     console.print(f"  [green]✓[/green] {len(pr.files_changed)} files, head {pr.head_sha[:7]}")
@@ -38,14 +38,14 @@ def node_fetch_pr(state):
 
 
 def node_analyze(state):
-    console.print("[cyan]→ analyze[/cyan]")
+    console.print("[cyan]-> analyze[/cyan]")
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
             {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
+                "Senior reviewer. Structured output. If your confidence score is low (< 0.60), "
+                "populate 'escalation_questions' with 2-4 specific, context-rich questions for "
+                "the human reviewer, referencing specific files or sections in the diff."
             )},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
@@ -54,7 +54,7 @@ def node_analyze(state):
 
 
 def node_route(state):
-    console.print("[cyan]→ route[/cyan]")
+    console.print("[cyan]-> route[/cyan]")
     c = state["analysis"].confidence
     if c >= AUTO_APPROVE_THRESHOLD: decision = "auto_approve"
     elif c < ESCALATE_THRESHOLD:    decision = "escalate"
@@ -66,27 +66,42 @@ def node_route(state):
 def node_escalate(state: ReviewState) -> dict:
     """Ask the reviewer specific questions; return their answers in state."""
     a = state["analysis"]
-    questions = a.escalation_questions
-    if not questions:
-        # fallback when the LLM didn't generate any questions
-        questions = ["What is the intent of this PR?", "Any migration concerns?"]
-
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    payload = {
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": a.escalation_questions or ["What is the intent of this PR?", "Any migration concerns?"],
+    }
+    answers = interrupt(payload)
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    llm = get_llm().with_structured_output(PRAnalysis)
+    qa_pairs = "\n".join([f"Q: {q}\nA: {a}" for q, a in state["escalation_answers"].items()])
+    
+    prompt = f"""You previously reviewed a PR but were uncertain. A human reviewer has provided answers to your questions.
+    
+    PR Title: {state['pr_title']}
+    Original Diff:
+    {state['pr_diff']}
+    
+    Your initial analysis summary: {state['analysis'].summary}
+    
+    Human Feedback:
+    {qa_pairs}
+    
+    Synthesize a final, refined review. Your confidence should now be higher since you have the human's input.
+    """
+    
+    with console.status("[dim]Synthesizing refined review...[/dim]"):
+        refined = llm.invoke(prompt)
+    
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -126,7 +141,7 @@ def _post(state, label: str) -> str:
 
 
 def node_commit(state):
-    console.print("[cyan]→ commit[/cyan]")
+    console.print("[cyan]-> commit[/cyan]")
     # Two paths converge here:
     #   1. human_approval → commit (only post if approved)
     #   2. escalate → synthesize → commit (always post the refined review)
@@ -161,7 +176,8 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 

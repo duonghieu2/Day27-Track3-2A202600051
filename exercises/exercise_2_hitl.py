@@ -31,7 +31,7 @@ console = Console()
 
 
 def node_fetch_pr(state: ReviewState) -> dict:
-    console.print("[cyan]→ fetch_pr[/cyan]")
+    console.print("[cyan]-> fetch_pr[/cyan]")
     with console.status("[dim]Fetching PR from GitHub...[/dim]"):
         pr = fetch_pr(state["pr_url"])
     console.print(f"  [green]✓[/green] {len(pr.files_changed)} files, head {pr.head_sha[:7]}")
@@ -39,7 +39,7 @@ def node_fetch_pr(state: ReviewState) -> dict:
 
 
 def node_analyze(state: ReviewState) -> dict:
-    console.print("[cyan]→ analyze[/cyan]")
+    console.print("[cyan]-> analyze[/cyan]")
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
@@ -51,7 +51,7 @@ def node_analyze(state: ReviewState) -> dict:
 
 
 def node_route(state: ReviewState) -> dict:
-    console.print("[cyan]→ route[/cyan]")
+    console.print("[cyan]-> route[/cyan]")
     c = state["analysis"].confidence
     if c >= AUTO_APPROVE_THRESHOLD: decision = "auto_approve"
     elif c < ESCALATE_THRESHOLD:    decision = "escalate"
@@ -63,17 +63,16 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    payload = {
+        "kind": "approval_request",
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    }
+    response = interrupt(payload)
+    return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -99,7 +98,7 @@ def _post(state: ReviewState, label: str) -> str:
 
 
 def node_commit(state: ReviewState) -> dict:
-    console.print("[cyan]→ commit[/cyan]")
+    console.print("[cyan]-> commit[/cyan]")
     if state.get("human_choice") == "approve":
         return {"final_action": _post(state, "committed")}
     console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
@@ -107,7 +106,7 @@ def node_commit(state: ReviewState) -> dict:
 
 
 def node_auto_approve(state):
-    console.print("[cyan]→ auto_approve[/cyan]  [dim]high confidence — posting directly[/dim]")
+    console.print("[cyan]-> auto_approve[/cyan]  [dim]high confidence — posting directly[/dim]")
     return {"final_action": _post(state, "auto_approved")}
 
 
@@ -133,8 +132,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -174,12 +172,10 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))
